@@ -1,0 +1,1 @@
+start cmd /k python avrora_parser.py

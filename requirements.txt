@@ -1,0 +1,6 @@
+requests
+aiohttp
+colorama
+pillow
+pytesseract
+playwright 
