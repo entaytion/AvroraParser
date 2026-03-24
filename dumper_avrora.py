@@ -99,6 +99,7 @@ async def run_dump():
                        OR products.price_old IS DISTINCT FROM EXCLUDED.price_old
                        OR products.name IS DISTINCT FROM EXCLUDED.name
                        OR (EXCLUDED.photo_thumb IS NOT NULL AND products.photo_thumb IS DISTINCT FROM EXCLUDED.photo_thumb)
+                       OR (EXCLUDED.photo_thumb IS NOT NULL AND products.photo_thumb IS NULL)
                     RETURNING barcode, name, price, price_old, (xmax = 0) AS is_new
                 """
                 
