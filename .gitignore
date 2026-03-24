@@ -1,2 +1,24 @@
-temp_photo.png
-temp_photo_bw.png
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+build/
+dist/
+
+# Local databases & dumps
+*.db
+*.csv
+removed_products.txt
+
+# Temp files (parser images)
+*.png
+temp_photo*
+
+# Environment
+.env
+.python-version
+
+# IDE
+.vscode/
+.idea/

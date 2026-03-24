@@ -1,0 +1,9 @@
+[project]
+name = "AvroraParser"
+version = "1.0.0"
+description = "Parser for Avrora with love and AI by @entaytion"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.5",
+]

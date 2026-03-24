@@ -1,0 +1,28 @@
+name: Nightly Avrora Price Sync
+
+on:
+  schedule:
+    - cron: '0 21 * * *'  # 23:00 за Києвом (21:00 UTC)
+  workflow_dispatch:      # Щоб можна було запустити руками через інтерфейс GitHub
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv pip install aiohttp psycopg2-binary
+        # Встановлюємо сюди, бо ми не пушимо .venv у Git
+
+      - name: Run Dumper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: uv run python dumper_avrora.py
