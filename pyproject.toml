@@ -5,5 +5,10 @@ description = "Parser for Avrora with love and AI by @entaytion"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "requests>=2.32.5",
+    "requests",
+    "aiohttp",
+    "psycopg2-binary",
+    "python-dotenv",
+    "pillow",
+    "selectolax",
 ]
