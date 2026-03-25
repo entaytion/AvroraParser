@@ -1,135 +1,287 @@
 import asyncio
 import aiohttp
-import psycopg2
-from psycopg2.extras import execute_values
+import asyncpg
+import aioboto3
+import hashlib
 import os
+import io
+import json
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from PIL import Image
+try:
+    import pillow_avif  # Реєструє AVIF плагін
+except ImportError:
+    pass
 
 load_dotenv()
 
+# --- Config ---
 PG_URL = os.getenv("DATABASE_URL")
+R2_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET = os.getenv("R2_SECRET_KEY")
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+R2_BUCKET = os.getenv("R2_BUCKET")
+CDN_URL = os.getenv("CDN_URL")
+
 SHOP_NUMBER = "988"
 MAX_BARCODE = 150000
+CONCURRENCY = 15
+RECENT_SKIP_HOURS = 24
 
-current_concurrency = 8
-current_delay = 1.2
+class AvroraDumper:
+    def __init__(self):
+        self.session = None
+        self.db_pool = None
+        self.r2_session = aioboto3.Session()
+        self.recent_barcodes = set()
+        
+        # Статистика для батчу
+        self.batch_stats = {
+            'new': 0,
+            'updated': 0,
+            'unchanged': 0,
+            'batch_start': 0,
+            'batch_end': 0
+        }
 
-async def fetch_product(session, barcode):
-    url = f"https://pt.avrora.ua/api/PriceTag/getInfo?barcode={barcode}&shopNumber={SHOP_NUMBER}"
-    try:
-        async with session.get(url, timeout=5) as resp:
-            if resp.status == 429: return "LIMIT"
-            if resp.status != 200: return None
-            data = await resp.json()
-            if not data.get('status') or "successfully" not in data.get('message', '').lower():
-                return None
-            
-            # Compress photo if exists
-            photo_b64 = None
-            raw_photo = data.get('data', {}).get('photo') or data.get('photo')
-            if raw_photo and "null" not in str(raw_photo).lower():
-                try:
-                    import base64
-                    from io import BytesIO
-                    from PIL import Image
-                    rawb = raw_photo.split(",")[-1] if "," in raw_photo else raw_photo
-                    img_data = base64.b64decode(rawb)
-                    img = Image.open(BytesIO(img_data)).convert("RGB")
-                    img.thumbnail((100, 100))
-                    out = BytesIO()
-                    img.save(out, format="WEBP", quality=60)
-                    photo_b64 = base64.b64encode(out.getvalue()).decode("utf-8")
-                except Exception as e:
-                    pass
+    async def init(self):
+        self.session = aiohttp.ClientSession(headers={"User-Agent": "AvroraParser/2.0"})
+        self.db_pool = await asyncpg.create_pool(PG_URL)
+        
+        async with self.db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS products (
+                    barcode TEXT PRIMARY KEY,
+                    name TEXT,
+                    kt TEXT,
+                    price NUMERIC(12,2),
+                    price_old NUMERIC(12,2),
+                    image_hash TEXT,
+                    image_base_url TEXT,
+                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_products_image_hash ON products(image_hash);
+            """)
 
-            return (
-                str(barcode), 
-                data.get('data', {}).get('name') or data.get('name'), 
-                data.get('data', {}).get('kt') or data.get('kt'), 
-                float(data.get('data', {}).get('price') or data.get('price', 0)), 
-                float(data.get('data', {}).get('priceOld') or data.get('priceOld', 0)),
-                photo_b64
-            )
-    except:
+    async def get_image_data(self, raw_data):
+        """Витягує байти картинки з Base64 або URL."""
+        if not raw_data or str(raw_data).lower() == "null":
+            return None
+        try:
+            if "data:image" in raw_data:
+                import base64
+                return base64.b64decode(raw_data.split(",")[-1])
+            # Якщо раптом прийде посилання - скачаємо
+            async with self.session.get(raw_data, timeout=10) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+        except:
+            pass
         return None
 
-async def init_db(conn):
-    cur = conn.cursor()
-    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_thumb TEXT;")
-    conn.commit()
-    cur.close()
+    def process_image(self, img_bytes, size, quality):
+        """Ресайз в AVIF без метаданих."""
+        buf = io.BytesIO()
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            img = img.convert("RGB")
+            img.thumbnail((size, size))
+            img.save(buf, format="AVIF", quality=quality, speed=6)
+        return buf.getvalue()
 
-async def run_dump():
-    global current_concurrency, current_delay
-    print(f"📡 Запуск адаптивного дампера з компресією фотографій...")
-    
-    if not PG_URL:
-        print("❌ DATABASE_URL не встановлено!")
-        return
+    async def upload_to_r2(self, s3_client, barcode, img_bytes, mode):
+        """Заливка в Cloudflare R2."""
+        key = f"products/{barcode}/{mode}.avif"
+        await s3_client.put_object(
+            Bucket=R2_BUCKET,
+            Key=key,
+            Body=img_bytes,
+            ContentType="image/avif",
+            CacheControl="public, max-age=31536000, immutable"
+        )
+        return f"{CDN_URL}/{key}"
 
-    conn = psycopg2.connect(PG_URL)
-    await init_db(conn)
-    cur = conn.cursor()
+    async def process_product(self, barcode, s3_client):
+        url = f"https://pt.avrora.ua/api/PriceTag/getInfo?barcode={barcode}&shopNumber={SHOP_NUMBER}"
+        try:
+            async with self.session.get(url, timeout=5) as resp:
+                if resp.status != 200: 
+                    return None
+                data = await resp.json()
+                if not data.get('status') or "successfully" not in data.get('message', '').lower():
+                    return None
 
-    async with aiohttp.ClientSession() as session:
-        i = 1
-        while i <= MAX_BARCODE:
-            tasks = [fetch_product(session, bc) for bc in range(i, min(i + current_concurrency, MAX_BARCODE + 1))]
-            results = await asyncio.gather(*tasks)
-            
-            if "LIMIT" in results:
-                print("⚠️ Помилка, рейтліміт, ми почекаємо...")
-                current_concurrency = 5
-                current_delay = 2.5
-                await asyncio.sleep(5)
-                continue
-            
-            valid_results = [r for r in results if r and r != "LIMIT"]
-            if valid_results:
-                query = """
-                    INSERT INTO products (barcode, name, kt, price, price_old, photo_thumb)
-                    VALUES %s
-                    ON CONFLICT (barcode) DO UPDATE SET
-                        name = EXCLUDED.name, 
-                        price = EXCLUDED.price, 
-                        price_old = EXCLUDED.price_old,
-                        photo_thumb = COALESCE(EXCLUDED.photo_thumb, products.photo_thumb),
-                        last_checked = CURRENT_TIMESTAMP
-                    WHERE products.price IS DISTINCT FROM EXCLUDED.price 
-                       OR products.price_old IS DISTINCT FROM EXCLUDED.price_old
-                       OR products.name IS DISTINCT FROM EXCLUDED.name
-                       OR (EXCLUDED.photo_thumb IS NOT NULL AND products.photo_thumb IS DISTINCT FROM EXCLUDED.photo_thumb)
-                       OR (EXCLUDED.photo_thumb IS NOT NULL AND products.photo_thumb IS NULL)
-                    RETURNING barcode, name, price, price_old, (xmax = 0) AS is_new
-                """
-                
-                try:
-                    cur.execute("BEGIN;")
-                    execute_values(cur, query, valid_results)
-                    changes = cur.fetchall()
-                    conn.commit()
+                prod = data.get('data') or data
+                name = str(prod.get('name', '')).strip()
+                kt = str(prod.get('kt', '')).strip()
+                price = float(prod.get('price', 0))
+                price_old = float(prod.get('priceOld', 0))
+                raw_photo = prod.get('photo') or prod.get('main_photo')
 
-                    if changes:
-                        print(f"🔥 Зміни та нові товари (батч {i}):")
-                        for barcode, name, price, price_old, is_new in changes:
-                            label = "[НОВИЙ]" if is_new else "[ЗМІНА]"
-                            print(f"   {label} Артикул: {barcode} | {name[:40]}... | Ціна: {price} (Минула: {price_old})")
+                img_hash, img_base_url = None, None
+                img_bytes = await self.get_image_data(raw_photo)
+
+                if img_bytes:
+                    img_hash = hashlib.sha256(img_bytes).hexdigest()
                     
-                    print(f"✅ Все окей, йдемо далі. (Баркод {i}, швидкість {current_concurrency})")
-                    current_concurrency = min(10, current_concurrency + 1)
-                    current_delay = max(1.0, current_delay - 0.1)
-                except Exception as e:
-                    conn.rollback()
-                    print(f"❌ Помилка БД: {e}")
+                    # Перевіряємо дублікати картинки в базі
+                    async with self.db_pool.acquire() as conn:
+                        existing = await conn.fetchrow(
+                            "SELECT image_base_url FROM products WHERE image_hash = $1 LIMIT 1", 
+                            img_hash
+                        )
+                        if existing:
+                            img_base_url = existing['image_base_url']
+                        else:
+                            # Нова картинка - генеримо AVIF і заливаємо
+                            t_bytes = self.process_image(img_bytes, 256, 35)
+                            p_bytes = self.process_image(img_bytes, 512, 45)
+                            await self.upload_to_r2(s3_client, barcode, t_bytes, "thumb")
+                            await self.upload_to_r2(s3_client, barcode, p_bytes, "preview")
+                            img_base_url = f"{CDN_URL}/products/{barcode}"
+
+                # Перевіряємо, чи щось змінилось
+                async with self.db_pool.acquire() as conn:
+                    old = await conn.fetchrow(
+                        "SELECT name, kt, price, price_old, image_hash FROM products WHERE barcode = $1",
+                        str(barcode)
+                    )
+                    
+                    # Якщо існує і нічого не змінилось — тихо оновлюємо last_checked
+                    if old:
+                        changed = (
+                            old['name'] != name or
+                            old['kt'] != kt or
+                            old['price'] != price or
+                            old['price_old'] != price_old or
+                            old['image_hash'] != img_hash
+                        )
+                        if not changed:
+                            await conn.execute(
+                                "UPDATE products SET last_checked = CURRENT_TIMESTAMP WHERE barcode = $1",
+                                str(barcode)
+                            )
+                            self.batch_stats['unchanged'] += 1
+                            return None  # Нічого не змінилось — не друкуємо
+                    
+                    # Якщо новий або змінився — робимо UPSERT
+                    row = await conn.fetchrow("""
+                        INSERT INTO products (barcode, name, kt, price, price_old, image_hash, image_base_url, last_checked)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+                        ON CONFLICT (barcode) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            kt = EXCLUDED.kt,
+                            price = EXCLUDED.price,
+                            price_old = EXCLUDED.price_old,
+                            image_hash = COALESCE(EXCLUDED.image_hash, products.image_hash),
+                            image_base_url = COALESCE(EXCLUDED.image_base_url, products.image_base_url),
+                            last_checked = CURRENT_TIMESTAMP
+                        RETURNING (xmax = 0) as is_new
+                    """, str(barcode), name, kt, price, price_old, img_hash, img_base_url)
+
+                is_new = row['is_new']
+                if is_new:
+                    self.batch_stats['new'] += 1
+                else:
+                    self.batch_stats['updated'] += 1
+                
+                status = "🆕 NEW" if is_new else "🔄 UPD"
+                
+                # Друкуємо тільки якщо щось змінилось
+                print(json.dumps({
+                    "status": status,
+                    "barcode": barcode,
+                    "name": name[:30],
+                    "price": price,
+                    "thumb": f"{img_base_url}/thumb.avif" if img_base_url else None
+                }, ensure_ascii=False))
+                
+                return status
+
+        except Exception as e:
+            # print(f"Error {barcode}: {e}")
+            return None
+
+    def print_batch_summary(self):
+        """Друкує підсумок по батчу, якщо не було змін."""
+        start = self.batch_stats['batch_start']
+        end = self.batch_stats['batch_end']
+        new = self.batch_stats['new']
+        upd = self.batch_stats['updated']
+        unch = self.batch_stats['unchanged']
+        
+        if new == 0 and upd == 0 and unch > 0:
+            print(f"💤 Змін у баркодах {start}-{end} не виявлено ({unch} без змін)")
+        elif unch > 0:
+            print(f"📊 Батч {start}-{end}: 🆕 {new} | 🔄 {upd} | 💤 {unch}")
+        
+        # Скидаємо статистику
+        self.batch_stats = {'new': 0, 'updated': 0, 'unchanged': 0, 'batch_start': 0, 'batch_end': 0}
+
+    async def run(self):
+        await self.init()
+        
+        print("\n📦 АВРОРА ДАМПЕР 2.0 (AVIF + R2 Edition)")
+        print("1. Повний перебор (почати з 1-го баркоду)")
+        print("2. Резюмувати (продовжити з останнього місця)")
+        choice = input("> ").strip()
+
+        async with self.db_pool.acquire() as conn:
+            if choice == "2":
+                last_done = await conn.fetchval(
+                    "SELECT MAX(barcode::int) FROM products WHERE last_checked >= NOW() - ($1 * INTERVAL '1 hour') AND barcode ~ '^[0-9]+$'",
+                    RECENT_SKIP_HOURS
+                )
+                start_i = (last_done or 0) + 1
+                
+                # Завантажуємо список нещодавно перевірених, щоб скіпати дирки
+                rows = await conn.fetch(
+                    "SELECT barcode FROM products WHERE last_checked >= NOW() - ($1 * INTERVAL '1 hour')",
+                    RECENT_SKIP_HOURS
+                )
+                self.recent_barcodes = {str(r['barcode']) for r in rows}
+                print(f"⏩ Резюмуємо з {start_i}. Знайдено {len(self.recent_barcodes)} актуальних баркодів.")
             else:
-                print(f"🧬 Баркод {i}: товарів не знайдено.")
+                start_i = 1
+                self.recent_barcodes = set()
+                print("🔄 Починаємо повний перебор з 1-го баркоду...")
 
-            i += current_concurrency
-            await asyncio.sleep(current_delay)
+        print(f"🚀 Запуск! Concurrency: {CONCURRENCY}\n")
 
-    cur.close()
-    conn.close()
-    print("✅ Все, дамп закінчено.")
+        async with self.r2_session.client(
+            's3', endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_KEY,
+            aws_secret_access_key=R2_SECRET
+        ) as s3:
+            for i in range(start_i, MAX_BARCODE + 1, CONCURRENCY):
+                batch = [bc for bc in range(i, min(i + CONCURRENCY, MAX_BARCODE + 1)) 
+                         if str(bc) not in self.recent_barcodes]
+                if not batch: 
+                    continue
+                
+                # Запам'ятовуємо межі батчу
+                self.batch_stats['batch_start'] = batch[0]
+                self.batch_stats['batch_end'] = batch[-1]
+                
+                # Обробляємо батч
+                await asyncio.gather(*(self.process_product(bc, s3) for bc in batch))
+                
+                # Друкуємо підсумок, якщо не було змін
+                self.print_batch_summary()
+                
+                await asyncio.sleep(0.5)  # Anti-rate-limit
+
+    async def close(self):
+        if self.session: 
+            await self.session.close()
+        if self.db_pool: 
+            await self.db_pool.close()
 
 if __name__ == "__main__":
-    asyncio.run(run_dump())
+    dumper = AvroraDumper()
+    try:
+        asyncio.run(dumper.run())
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Зупинено користувачем")
+    finally:
+        asyncio.run(dumper.close())
